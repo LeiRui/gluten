@@ -12,9 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import re
+from pathlib import Path
 
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools import files, scm
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.env import Environment, VirtualBuildEnv, VirtualRunEnv
@@ -124,6 +128,28 @@ class GlutenConan(ConanFile):
             self.options[bolt].enable_test = True
             self.options[bolt].enable_testutil = True
 
+    def _bolt_arm_isa(self):
+        manifest = Path(self.dependencies["bolt"].package_folder) / "res/bolt/arm-isa-v1.json"
+        if not manifest.exists():
+            # Older Bolt packages predate the target-options manifest.
+            target = "armv9-a" if str(self.settings.arch) == "armv9" else "armv8.3-a"
+            self.output.warning(f"Bolt has no ARM target manifest; using {target}")
+            return [f"-march={target}"]
+
+        flags = json.loads(manifest.read_text(encoding="utf-8"))
+        option = (
+            r"-(?:m(?:arch|cpu)=[A-Za-z0-9_.+-]+|msve-vector-bits=(?:scalable|[0-9]+)"
+            r"|DSVE_BITS(?:=[0-9]+)?|USVE_BITS)"
+        )
+        if (
+            not isinstance(flags, list)
+            or not all(isinstance(f, str) and re.fullmatch(option, f) for f in flags)
+            or not any(f.startswith(("-march=", "-mcpu=")) for f in flags)
+            or any(f.partition("=")[2].split("+", 1)[0] == "native" for f in flags)
+        ):
+            raise ConanInvalidConfiguration(f"Invalid Bolt ARM target options in {manifest}")
+        return flags
+
     def generate(self):
         build_env = VirtualBuildEnv(self)
         build_env.generate()
@@ -146,11 +172,7 @@ class GlutenConan(ConanFile):
         if str(self.settings.arch) in ["armv8", "armv9"]:
             cxx_flags = f"{cxx_flags}  -ffunction-sections -fdata-sections "
 
-            # Support CRC & NEON on ARMv8
-            if str(self.settings.arch) in ["armv8"]:
-                cxx_flags = f"{cxx_flags} -march=armv8.3-a"
-            if str(self.settings.arch) in ["armv9"]:
-                cxx_flags = f"{cxx_flags} -march=-march=armv9-a"
+            cxx_flags += " ".join(self._bolt_arm_isa())
 
             tc.cache_variables["CMAKE_CXX_FLAGS"] = cxx_flags
             tc.cache_variables["CMAKE_C_FLAGS"] = cxx_flags
